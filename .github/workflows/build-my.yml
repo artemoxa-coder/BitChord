@@ -1,0 +1,64 @@
+name: Build my BitChord
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Take clean 1.9.1 code and apply the patch
+        run: |
+          cp bitchord-changes.patch /tmp/bitchord-changes.patch
+          git fetch https://github.com/kushagrasinghx/BitChord.git --tags
+          git checkout -f v1.9.1 || git checkout -f 1.9.1
+          git apply -p1 --verbose /tmp/bitchord-changes.patch
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Signing key
+        run: |
+          git show origin/keys:my.jks > my.jks 2>/dev/null || rm -f my.jks
+          if [ ! -s my.jks ]; then
+            keytool -genkey -v -keystore my.jks -keyalg RSA -keysize 2048 \
+              -validity 10000 -alias bitchord \
+              -storepass bitchord123 -keypass bitchord123 -dname "CN=BitChord"
+            mkdir /tmp/k && cp my.jks /tmp/k/
+            cd /tmp/k
+            git init -q -b keys
+            git add my.jks
+            git -c user.name=bot -c user.email=bot@example.com commit -qm "key"
+            git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" keys
+          fi
+        shell: bash
+
+      - name: Write keystore.properties
+        run: |
+          {
+            echo "storeFile=my.jks"
+            echo "storePassword=bitchord123"
+            echo "keyAlias=bitchord"
+            echo "keyPassword=bitchord123"
+          } > keystore.properties
+
+      - run: chmod +x gradlew
+
+      - name: Build
+        run: ./gradlew assembleProdRelease
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: my-bitchord-apk
+          path: app/build/outputs/apk/prod/release/*.apk
