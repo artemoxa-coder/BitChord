@@ -1,0 +1,245 @@
+diff -ruN orig/app/src/main/java/com/music/bitchord/MainActivity.kt BitChord-1.9/app/src/main/java/com/music/bitchord/MainActivity.kt
+--- orig/app/src/main/java/com/music/bitchord/MainActivity.kt	2026-10-30 23:20:20.086039498 +0000
++++ BitChord-1.9/app/src/main/java/com/music/bitchord/MainActivity.kt	2026-10-30 23:27:07.962817444 +0000
+@@ -813,7 +813,7 @@
+     // The reorder list lives on its playlist's page; leaving that page by any
+     // route — Back, a tab, another page over it — puts the list away with it.
+     LaunchedEffect(detail?.browseId) {
+-        if (reorderTarget?.browseId != detail?.browseId) reorderTarget = null
++        if (reorderTarget?.pageId != detail?.browseId) reorderTarget = null
+     }
+ 
+     SystemBarIcons(
+@@ -3227,7 +3227,7 @@
+                                 )
+                             }
+                             // This page's songs being rearranged, drawn in place of its list.
+-                            val reordering = reorderTarget?.takeIf { it.browseId == page.browseId }
++                            val reordering = reorderTarget?.takeIf { it.pageId == page.browseId }
+                             DetailScreen(
+                                 page = page,
+                                 currentSong = player.song,
+@@ -3316,6 +3316,17 @@
+                                             ),
+                                             onClose = { reorderTarget = null },
+                                             onSave = { reordered ->
++                                                if (reordering.playlistId.startsWith("local:")) {
++                                                    // On this device: nothing to send, so saved on the spot.
++                                                    val saved = viewModel.reorderLocalPlaylist(reordering.playlistId, reordered)
++                                                    showQueueNotice(
++                                                        context.getString(
++                                                            if (saved) R.string.playlist_reordered else R.string.reorder_failed,
++                                                        ),
++                                                    )
++                                                    if (saved && reorderTarget == reordering) reorderTarget = null
++                                                    return@ReorderPlaylistPage
++                                                }
+                                                 val original = (reorderEntries as? UiState.Success)?.data.orEmpty()
+                                                 reorderSaving = true
+                                                 viewModel.reorderPlaylist(reordering, original, reordered) { saved ->
+@@ -5030,6 +5041,14 @@
+             // One of the offline player's own playlists, which are the user's
+             // to rename and delete — all but Liked, which is the app's.
+             val offlineEditable = OfflinePlaylists.get(target.browseId)?.takeUnless { it.isLiked }
++            // A playlist kept on this device whose songs can be rearranged:
++            // the id, title and tracks. Liked stays newest-first.
++            val deviceOrder = target.browseId?.let { id ->
++                offlineEditable?.let { Triple(id, it.title, it.songs) }
++                    ?: id.takeIf { it.startsWith("local:playlist:sp_local_") }?.let {
++                        com.music.bitchord.data.spotify.LocalPlaylistStore.getPlaylist(it)
++                    }?.let { Triple(id, it.title, it.songs) }
++            }
+             BrowseActionsMenu(
+                 // The live answer, not the one the target was built with.
+                 target = target.copy(
+@@ -5167,6 +5186,24 @@
+                             )
+                         }
+                     }
++                } ?: deviceOrder?.let { (id, title, songs) ->
++                    {
++                        browseActions = null
++                        if (detail?.browseId != id) {
++                            viewModel.openDetail(
++                                browseId = id,
++                                title = title,
++                                subtitle = target.subtitle,
++                                thumbnailUrl = target.thumbnailUrl,
++                                type = BrowseType.PLAYLIST,
++                            )
++                        }
++                        detailSearching = false
++                        reorderTarget = UserPlaylist(playlistId = id, title = title, subtitle = "", thumbnailUrl = null)
++                        // Throwaway slot ids: the reorder page tells rows apart by them.
++                        reorderEntries = UiState.Success(songs.mapIndexed { i, s -> s.copy(setVideoId = "device-$i") })
++                        reorderSaving = false
++                    }
+                 },
+                 onDelete = playlist?.let { p ->
+                     {
+@@ -6068,6 +6105,8 @@
+     SongSort.DEFAULT -> stringResource(R.string.sort_default)
+     SongSort.TITLE_ASC -> stringResource(R.string.sort_title_ascending)
+     SongSort.TITLE_DESC -> stringResource(R.string.sort_title_descending)
++    SongSort.ARTIST_ASC -> stringResource(R.string.sort_artist_ascending)
++    SongSort.ARTIST_DESC -> stringResource(R.string.sort_artist_descending)
+     SongSort.DATE_ADDED_ASC -> stringResource(R.string.sort_date_added_oldest)
+     SongSort.DATE_ADDED_DESC -> stringResource(R.string.sort_date_added)
+ }
+@@ -6176,3 +6215,7 @@
+ private const val TAB_EXPLORE = 1
+ private const val TAB_LIBRARY = 2
+ private const val TAB_SEARCH = 3
++
++/** The page a reorder belongs to: a device playlist is its own page id, an account one is "VL…". */
++private val UserPlaylist.pageId: String
++    get() = if (playlistId.startsWith("local:")) playlistId else browseId
+diff -ruN orig/app/src/main/java/com/music/bitchord/data/OfflinePlaylists.kt BitChord-1.9/app/src/main/java/com/music/bitchord/data/OfflinePlaylists.kt
+--- orig/app/src/main/java/com/music/bitchord/data/OfflinePlaylists.kt	2026-10-30 23:20:20.086706701 +0000
++++ BitChord-1.9/app/src/main/java/com/music/bitchord/data/OfflinePlaylists.kt	2026-10-30 23:27:07.945314295 +0000
+@@ -155,6 +155,29 @@
+         }
+     }
+ 
++    /**
++     * Stores [songs] as the new running order of a device playlist. Refused
++     * (false) for Liked, which is newest-first by design, and unless [songs]
++     * are exactly the tracks the playlist already holds.
++     */
++    fun reorder(browseId: String, songs: List<Song>): Boolean {
++        val id = browseId.removePrefix(PREFIX)
++        if (id == LIKED_ID) return false
++        var saved = false
++        mutate { list ->
++            list.map { playlist ->
++                if (playlist.id != id) return@map playlist
++                val same = songs.mapNotNull { it.localUri }.sorted() ==
++                    playlist.songs.mapNotNull { it.localUri }.sorted() &&
++                    songs.size == playlist.songs.size
++                if (!same) return@map playlist
++                saved = true
++                playlist.copy(songs = songs.map { it.stored() })
++            }
++        }
++        return saved
++    }
++
+     /** Liked is the app's, not the user's: it can't be renamed or deleted. */
+     fun rename(browseId: String, title: String) {
+         val id = browseId.removePrefix(PREFIX)
+diff -ruN orig/app/src/main/java/com/music/bitchord/data/settings/AppSettings.kt BitChord-1.9/app/src/main/java/com/music/bitchord/data/settings/AppSettings.kt
+--- orig/app/src/main/java/com/music/bitchord/data/settings/AppSettings.kt	2026-10-30 23:20:20.087699094 +0000
++++ BitChord-1.9/app/src/main/java/com/music/bitchord/data/settings/AppSettings.kt	2026-10-30 23:20:20.222507233 +0000
+@@ -169,6 +169,8 @@
+     DEFAULT,
+     TITLE_ASC,
+     TITLE_DESC,
++    ARTIST_ASC,
++    ARTIST_DESC,
+     DATE_ADDED_ASC,
+     DATE_ADDED_DESC,
+ }
+diff -ruN orig/app/src/main/java/com/music/bitchord/data/spotify/LocalPlaylistStore.kt BitChord-1.9/app/src/main/java/com/music/bitchord/data/spotify/LocalPlaylistStore.kt
+--- orig/app/src/main/java/com/music/bitchord/data/spotify/LocalPlaylistStore.kt	2026-10-30 23:20:20.088609355 +0000
++++ BitChord-1.9/app/src/main/java/com/music/bitchord/data/spotify/LocalPlaylistStore.kt	2026-10-30 23:27:07.944271893 +0000
+@@ -89,6 +89,19 @@
+         persist(updated)
+     }
+ 
++    /**
++     * Stores [songs] as the new running order of the playlist [id]. Refused
++     * (false) unless they are exactly the tracks it already holds.
++     */
++    fun reorder(id: String, songs: List<Song>): Boolean {
++        val current = getPlaylist(id) ?: return false
++        if (songs.map { it.videoId }.sorted() != current.songs.map { it.videoId }.sorted()) return false
++        val updated = _playlists.value.map { if (it.id == current.id) it.copy(songs = songs) else it }
++        _playlists.value = updated
++        persist(updated)
++        return true
++    }
++
+     fun getPlaylist(id: String): LocalPlaylist? {
+         val cleanId = id.removePrefix("local:playlist:").removePrefix("VL")
+         return _playlists.value.firstOrNull { it.id == cleanId || it.id == id || it.browseId == id }
+diff -ruN orig/app/src/main/java/com/music/bitchord/ui/MainViewModel.kt BitChord-1.9/app/src/main/java/com/music/bitchord/ui/MainViewModel.kt
+--- orig/app/src/main/java/com/music/bitchord/ui/MainViewModel.kt	2026-10-30 23:20:20.092110415 +0000
++++ BitChord-1.9/app/src/main/java/com/music/bitchord/ui/MainViewModel.kt	2026-10-30 23:27:07.947524583 +0000
+@@ -1333,6 +1333,34 @@
+         }
+     }
+ 
++    /**
++     * Saves a new running order for a playlist kept on this device — one of
++     * the offline player's own, or a Spotify import — and puts the open page
++     * into that order. Nothing is sent anywhere. False when the store refused.
++     */
++    fun reorderLocalPlaylist(browseId: String, reordered: List<Song>): Boolean {
++        // The reorder page tags rows with throwaway slot ids; they are not the playlist's.
++        val songs = reordered.map { it.copy(setVideoId = null) }
++        val saved = if (OfflinePlaylists.isOfflinePlaylist(browseId)) {
++            OfflinePlaylists.reorder(browseId, songs)
++        } else {
++            com.music.bitchord.data.spotify.LocalPlaylistStore.reorder(browseId, songs)
++        }
++        if (!saved) return false
++        fun Song.slot() = localUri ?: videoId
++        val rank = HashMap<String, Int>()
++        songs.forEachIndexed { index, song -> rank[song.slot()] = index }
++        _detailStack.value = _detailStack.value.map { page ->
++            val shown = (page.songs as? UiState.Success)?.data
++            if (page.browseId != browseId || shown == null) {
++                page
++            } else {
++                page.copy(songs = UiState.Success(shown.sortedBy { rank[it.slot()] ?: Int.MAX_VALUE }))
++            }
++        }
++        return true
++    }
++
+     fun deletePlaylist(playlist: UserPlaylist) {
+         if (!requireSignIn()) return
+         viewModelScope.launch {
+diff -ruN orig/app/src/main/java/com/music/bitchord/ui/screens/DetailScreen.kt BitChord-1.9/app/src/main/java/com/music/bitchord/ui/screens/DetailScreen.kt
+--- orig/app/src/main/java/com/music/bitchord/ui/screens/DetailScreen.kt	2026-10-30 23:20:20.094741426 +0000
++++ BitChord-1.9/app/src/main/java/com/music/bitchord/ui/screens/DetailScreen.kt	2026-10-30 23:20:20.223328299 +0000
+@@ -1196,6 +1196,9 @@
+     SongSort.DEFAULT -> this
+     SongSort.TITLE_ASC -> sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.title })
+     SongSort.TITLE_DESC -> sortedWith(compareByDescending(String.CASE_INSENSITIVE_ORDER) { it.title })
++    // Ties (same artist) keep their running order: sortedWith is stable.
++    SongSort.ARTIST_ASC -> sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.artist })
++    SongSort.ARTIST_DESC -> sortedWith(compareByDescending(String.CASE_INSENSITIVE_ORDER) { it.artist })
+     // A catalogue row carries no added date, so its place in the running
+     // order stands in for one: a playlist is appended to as songs are added,
+     // and reversed that puts the most recent addition on top. Rows that do
+diff -ruN orig/app/src/main/res/values/strings.xml BitChord-1.9/app/src/main/res/values/strings.xml
+--- orig/app/src/main/res/values/strings.xml	2026-10-30 23:20:20.116670724 +0000
++++ BitChord-1.9/app/src/main/res/values/strings.xml	2026-10-30 23:20:22.850686118 +0000
+@@ -1,4 +1,4 @@
+-<resources>
++<resources xmlns:tools="http://schemas.android.com/tools">
+     <string name="app_name">BitChord</string>
+     <string name="playback_channel_name">Now playing</string>
+     <string name="download_channel_name">Downloads</string>
+@@ -817,6 +817,8 @@
+     <string name="sort_music">Sort music</string>
+     <string name="sort_title_ascending">Alphabetical (A to Z)</string>
+     <string name="sort_title_descending">Alphabetical (Z to A)</string>
++    <string name="sort_artist_ascending" tools:ignore="MissingTranslation">Artist (A to Z)</string>
++    <string name="sort_artist_descending" tools:ignore="MissingTranslation">Artist (Z to A)</string>
+     <string name="sort_date_added">Date added (newest first)</string>
+     <string name="sort_date_added_oldest">Date added (oldest first)</string>
+     <string name="sort_date_added_toggle">Date added</string>
+diff -ruN orig/app/src/main/res/values-ru/strings.xml BitChord-1.9/app/src/main/res/values-ru/strings.xml
+--- orig/app/src/main/res/values-ru/strings.xml	2026-10-30 23:20:20.115889238 +0000
++++ BitChord-1.9/app/src/main/res/values-ru/strings.xml	2026-10-30 23:20:20.227212508 +0000
+@@ -611,6 +611,8 @@
+     <string name="sort_music">Сортировка музыки</string>
+     <string name="sort_title_ascending">По алфавиту (А — Я)</string>
+     <string name="sort_title_descending">По алфавиту (Я — А)</string>
++    <string name="sort_artist_ascending">По исполнителю (А — Я)</string>
++    <string name="sort_artist_descending">По исполнителю (Я — А)</string>
+     <string name="sort_date_added">По дате добавления (сначала новые)</string>
+     <string name="sort_date_modified">По дате изменения (сначала новые)</string>
+     <string name="use_all_audio_folders">Использовать все папки с аудио</string>
