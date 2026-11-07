@@ -1,0 +1,1032 @@
+diff --git a/app/src/main/java/com/music/bitchord/MainActivity.kt b/app/src/main/java/com/music/bitchord/MainActivity.kt
+index 7d5caa1..d94bd86 100644
+--- a/app/src/main/java/com/music/bitchord/MainActivity.kt
++++ b/app/src/main/java/com/music/bitchord/MainActivity.kt
+@@ -155,6 +155,7 @@ import kotlinx.coroutines.withContext
+ import com.music.bitchord.data.model.durationMillis
+ import com.music.bitchord.data.scrobbling.LastFM
+ import com.music.bitchord.data.settings.AppSettings
++import com.music.bitchord.data.settings.CoverOverrides
+ import com.music.bitchord.data.settings.BitPerfectMode
+ import com.music.bitchord.ui.AddonBlockedAlert
+ import com.music.bitchord.data.settings.LibrarySort
+@@ -841,7 +842,7 @@ private fun BitChordApp(
+     // The reorder list lives on its playlist's page; leaving that page by any
+     // route — Back, a tab, another page over it — puts the list away with it.
+     LaunchedEffect(detail?.browseId) {
+-        if (reorderTarget?.browseId != detail?.browseId) reorderTarget = null
++        if (reorderTarget?.pageId != detail?.browseId) reorderTarget = null
+     }
+ 
+     SystemBarIcons(
+@@ -2176,6 +2177,27 @@ private fun BitChordApp(
+         }
+     }
+ 
++    // ---- Own covers ----
++    // A picture picked here is kept on this device and shown in place of the
++    // release's cover on its page.
++    val covers by CoverOverrides.map.collectAsStateWithLifecycle()
++    var coverPickFor by rememberSaveable { mutableStateOf<String?>(null) }
++    val coverPicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
++        val id = coverPickFor
++        coverPickFor = null
++        if (uri != null && id != null) {
++            val ok = CoverOverrides.set(context, id, uri)
++            Toast.makeText(
++                context,
++                context.getString(if (ok) R.string.cover_changed else R.string.cover_failed),
++                Toast.LENGTH_SHORT,
++            ).show()
++        }
++    }
++    // The tracks of a page waiting for the playlist they should be added to,
++    // with the page's own id so it is left out of the choices.
++    var moveAllFrom by remember { mutableStateOf<Pair<String?, List<Song>>?>(null) }
++
+     // ---- Downloads ----
+     // Two permissions, and never both on one device: writing to the shared
+     // Music folder needs storage access below API 29 and none at all from
+@@ -3268,9 +3290,10 @@ private fun BitChordApp(
+                                 )
+                             }
+                             // This page's songs being rearranged, drawn in place of its list.
+-                            val reordering = reorderTarget?.takeIf { it.browseId == page.browseId }
++                            val reordering = reorderTarget?.takeIf { it.pageId == page.browseId }
++                            Box(Modifier.fillMaxSize()) {
+                             DetailScreen(
+-                                page = page,
++                                page = covers[page.browseId]?.let { page.copy(thumbnailUrl = it) } ?: page,
+                                 currentSong = player.song,
+                                 isPlaying = player.isPlaying,
+                                 listState = pageDetailListState,
+@@ -3357,6 +3380,17 @@ private fun BitChordApp(
+                                             ),
+                                             onClose = { reorderTarget = null },
+                                             onSave = { reordered ->
++                                                if (reordering.playlistId.startsWith("local:")) {
++                                                    // On this device: nothing to send, so saved on the spot.
++                                                    val saved = viewModel.reorderLocalPlaylist(reordering.playlistId, reordered)
++                                                    showQueueNotice(
++                                                        context.getString(
++                                                            if (saved) R.string.playlist_reordered else R.string.reorder_failed,
++                                                        ),
++                                                    )
++                                                    if (saved && reorderTarget == reordering) reorderTarget = null
++                                                    return@ReorderPlaylistPage
++                                                }
+                                                 val original = (reorderEntries as? UiState.Success)?.data.orEmpty()
+                                                 reorderSaving = true
+                                                 viewModel.reorderPlaylist(reordering, original, reordered) { saved ->
+@@ -3375,6 +3409,13 @@ private fun BitChordApp(
+                                     null
+                                 },
+                             )
++                            com.music.bitchord.ui.components.FastScrollbar(
++                                state = pageDetailListState,
++                                modifier = Modifier.align(Alignment.TopEnd),
++                                topPadding = listPadding.calculateTopPadding(),
++                                bottomPadding = listPadding.calculateBottomPadding(),
++                            )
++                            }
+                         } else when ((destination as? AppDestination.Tab)?.index ?: selectedTab) {
+                             TAB_HOME -> HomeScreen(
+                                 state = visibleHomeState,
+@@ -4513,7 +4554,16 @@ private fun BitChordApp(
+                             songActions = null
+                             OfflinePlaylists.remove(id, song)
+                         }
+-                    },
++                    }
++                    // A Spotify import kept on this device: edited without an account.
++                    ?: detail?.browseId
++                        ?.takeIf { !fromPlayer && com.music.bitchord.data.spotify.LocalPlaylistStore.getPlaylist(it) != null }
++                        ?.let { id ->
++                            {
++                                songActions = null
++                                viewModel.removeFromLocalPlaylist(id, song)
++                            }
++                        },
+                 onRemoveFromCache = if (inCache) {
+                     {
+                         songActions = null
+@@ -5003,6 +5053,79 @@ private fun BitChordApp(
+             )
+         }
+ 
++        // ---- Add every track of a page to another playlist ----
++        moveAllFrom?.let { (sourceId, songs) ->
++            val deviceLists by com.music.bitchord.data.spotify.LocalPlaylistStore.playlists.collectAsStateWithLifecycle()
++            val movable = remember(songs) { songs.filter { it.localUri == null && it.videoId.isNotBlank() } }
++            val choices = remember(deviceLists, playlists, sourceId, signedIn) {
++                val device = deviceLists
++                    .filter { it.browseId != sourceId }
++                    .map { lp ->
++                        UserPlaylist(
++                            playlistId = lp.id,
++                            title = lp.title,
++                            subtitle = context.resources.getQuantityString(
++                                R.plurals.song_count_plural, lp.songs.size, lp.songs.size,
++                            ),
++                            thumbnailUrl = lp.songs.firstNotNullOfOrNull { it.thumbnailUrl },
++                        )
++                    }
++                val account = if (signedIn) playlists.filter { it.browseId != sourceId } else emptyList()
++                device + account
++            }
++            PlaylistPickerSheet(
++                playlists = choices,
++                loading = false,
++                song = null,
++                startCreating = false,
++                offline = !signedIn,
++                onDismiss = { moveAllFrom = null },
++                onAdd = { picked ->
++                    var addedHere = 0
++                    var touchedDevice = false
++                    picked.forEach { target ->
++                        if (com.music.bitchord.data.spotify.LocalPlaylistStore.getPlaylist(target.playlistId) != null) {
++                            touchedDevice = true
++                            addedHere += com.music.bitchord.data.spotify.LocalPlaylistStore
++                                .addSongs(target.playlistId, movable)
++                        } else {
++                            viewModel.addVideoIdsToPlaylist(target.playlistId, movable.map { it.videoId }) { added, lost ->
++                                showQueueNotice(
++                                    if (lost > 0) {
++                                        context.getString(R.string.move_all_partial, added, lost)
++                                    } else {
++                                        context.getString(R.string.move_all_done, added)
++                                    },
++                                )
++                            }
++                        }
++                    }
++                    if (touchedDevice) {
++                        showQueueNotice(
++                            if (addedHere > 0) {
++                                context.getString(R.string.move_all_done, addedHere)
++                            } else {
++                                context.getString(R.string.move_all_nothing)
++                            },
++                        )
++                    }
++                },
++                onCreate = { title, privacy ->
++                    viewModel.createPlaylistWithVideoIds(
++                        title,
++                        privacy,
++                        movable.map { it.videoId },
++                        movable,
++                        onPartial = { lost ->
++                            showQueueNotice(context.getString(R.string.spotify_import_partial, lost))
++                        },
++                    ) { _, _, _ ->
++                        showQueueNotice(context.getString(R.string.move_all_done, movable.size))
++                    }
++                },
++            )
++        }
++
+         if (showSpotifyImportDialog) {
+             BackHandler { showSpotifyImportDialog = false }
+             SpotifyImportAlert(
+@@ -5014,6 +5137,9 @@ private fun BitChordApp(
+                         privacy,
+                         songs.map { it.videoId },
+                         songs,
++                        onPartial = { lost ->
++                            showQueueNotice(context.getString(R.string.spotify_import_partial, lost))
++                        },
+                     ) { browseId, pTitle, savedLocally ->
+                         showQueueNotice(
+                             context.getString(
+@@ -5086,6 +5212,14 @@ private fun BitChordApp(
+             // One of the offline player's own playlists, which are the user's
+             // to rename and delete — all but Liked, which is the app's.
+             val offlineEditable = OfflinePlaylists.get(target.browseId)?.takeUnless { it.isLiked }
++            // A playlist kept on this device whose songs can be rearranged:
++            // the id, title and tracks. Liked stays newest-first.
++            val deviceOrder = target.browseId?.let { id ->
++                offlineEditable?.let { Triple(id, it.title, it.songs) }
++                    ?: id.takeIf { it.startsWith("local:playlist:sp_local_") }?.let {
++                        com.music.bitchord.data.spotify.LocalPlaylistStore.getPlaylist(it)
++                    }?.let { Triple(id, it.title, it.songs) }
++            }
+             BrowseActionsMenu(
+                 // The live answer, not the one the target was built with.
+                 target = target.copy(
+@@ -5223,7 +5357,44 @@ private fun BitChordApp(
+                             )
+                         }
+                     }
++                } ?: deviceOrder?.let { (id, title, songs) ->
++                    {
++                        browseActions = null
++                        if (detail?.browseId != id) {
++                            viewModel.openDetail(
++                                browseId = id,
++                                title = title,
++                                subtitle = target.subtitle,
++                                thumbnailUrl = target.thumbnailUrl,
++                                type = BrowseType.PLAYLIST,
++                            )
++                        }
++                        detailSearching = false
++                        reorderTarget = UserPlaylist(playlistId = id, title = title, subtitle = "", thumbnailUrl = null)
++                        // Throwaway slot ids: the reorder page tells rows apart by them.
++                        reorderEntries = UiState.Success(songs.mapIndexed { i, s -> s.copy(setVideoId = "device-$i") })
++                        reorderSaving = false
++                    }
+                 },
++                onChangeCover = target.browseId
++                    ?.takeIf { target.type != BrowseType.ARTIST }
++                    ?.let { id ->
++                        {
++                            browseActions = null
++                            coverPickFor = id
++                            coverPicker.launch("image/*")
++                        }
++                    },
++                onResetCover = target.browseId
++                    ?.takeIf { it in covers }
++                    ?.let { id ->
++                        {
++                            browseActions = null
++                            CoverOverrides.clear(id)
++                        }
++                    },
++                onMoveAll = act { songs -> moveAllFrom = target.browseId to songs }
++                    .takeIf { target.type == BrowseType.PLAYLIST || target.type == BrowseType.ALBUM },
+                 onDelete = playlist?.let { p ->
+                     {
+                         browseActions = null
+@@ -6167,6 +6338,8 @@ private fun SongSort.localizedLabel(): String = when (this) {
+     SongSort.DEFAULT -> stringResource(R.string.sort_default)
+     SongSort.TITLE_ASC -> stringResource(R.string.sort_title_ascending)
+     SongSort.TITLE_DESC -> stringResource(R.string.sort_title_descending)
++    SongSort.ARTIST_ASC -> stringResource(R.string.sort_artist_ascending)
++    SongSort.ARTIST_DESC -> stringResource(R.string.sort_artist_descending)
+     SongSort.DATE_ADDED_ASC -> stringResource(R.string.sort_date_added_oldest)
+     SongSort.DATE_ADDED_DESC -> stringResource(R.string.sort_date_added)
+ }
+@@ -6275,3 +6448,7 @@ private const val TAB_HOME = 0
+ private const val TAB_EXPLORE = 1
+ private const val TAB_LIBRARY = 2
+ private const val TAB_SEARCH = 3
++
++/** The page a reorder belongs to: a device playlist is its own page id, an account one is "VL…". */
++private val UserPlaylist.pageId: String
++    get() = if (playlistId.startsWith("local:")) playlistId else browseId
+diff --git a/app/src/main/java/com/music/bitchord/data/OfflinePlaylists.kt b/app/src/main/java/com/music/bitchord/data/OfflinePlaylists.kt
+index d3c7321..29818fc 100644
+--- a/app/src/main/java/com/music/bitchord/data/OfflinePlaylists.kt
++++ b/app/src/main/java/com/music/bitchord/data/OfflinePlaylists.kt
+@@ -155,6 +155,29 @@ object OfflinePlaylists {
+         }
+     }
+ 
++    /**
++     * Stores [songs] as the new running order of a device playlist. Refused
++     * (false) for Liked, which is newest-first by design, and unless [songs]
++     * are exactly the tracks the playlist already holds.
++     */
++    fun reorder(browseId: String, songs: List<Song>): Boolean {
++        val id = browseId.removePrefix(PREFIX)
++        if (id == LIKED_ID) return false
++        var saved = false
++        mutate { list ->
++            list.map { playlist ->
++                if (playlist.id != id) return@map playlist
++                val same = songs.mapNotNull { it.localUri }.sorted() ==
++                    playlist.songs.mapNotNull { it.localUri }.sorted() &&
++                    songs.size == playlist.songs.size
++                if (!same) return@map playlist
++                saved = true
++                playlist.copy(songs = songs.map { it.stored() })
++            }
++        }
++        return saved
++    }
++
+     /** Liked is the app's, not the user's: it can't be renamed or deleted. */
+     fun rename(browseId: String, title: String) {
+         val id = browseId.removePrefix(PREFIX)
+diff --git a/app/src/main/java/com/music/bitchord/data/settings/AppSettings.kt b/app/src/main/java/com/music/bitchord/data/settings/AppSettings.kt
+index dc20fb5..f69405b 100644
+--- a/app/src/main/java/com/music/bitchord/data/settings/AppSettings.kt
++++ b/app/src/main/java/com/music/bitchord/data/settings/AppSettings.kt
+@@ -170,6 +170,8 @@ enum class SongSort {
+     DEFAULT,
+     TITLE_ASC,
+     TITLE_DESC,
++    ARTIST_ASC,
++    ARTIST_DESC,
+     DATE_ADDED_ASC,
+     DATE_ADDED_DESC,
+ }
+@@ -935,6 +937,8 @@ object AppSettings {
+         prefs = context.getSharedPreferences("bitchord_settings", Context.MODE_PRIVATE)
+         this.authStore = authStore
+         com.music.bitchord.data.spotify.LocalPlaylistStore.init(context)
++        ProfileOverrides.init(context)
++        CoverOverrides.init(context)
+         com.music.bitchord.data.OfflinePlaylists.init(
+             context,
+             likedTitle = context.getString(com.music.bitchord.R.string.auto_liked),
+diff --git a/app/src/main/java/com/music/bitchord/data/settings/UserOverrides.kt b/app/src/main/java/com/music/bitchord/data/settings/UserOverrides.kt
+new file mode 100644
+index 0000000..3ddc039
+--- /dev/null
++++ b/app/src/main/java/com/music/bitchord/data/settings/UserOverrides.kt
+@@ -0,0 +1,128 @@
++package com.music.bitchord.data.settings
++
++import android.content.Context
++import android.content.SharedPreferences
++import android.graphics.Bitmap
++import android.graphics.BitmapFactory
++import android.net.Uri
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import org.json.JSONObject
++import java.io.File
++
++/**
++ * A picture chosen from the gallery, shrunk and kept in the app's own files so
++ * it outlives the picker's permission. Returns a file:// address, or null when
++ * the picture could not be read. Each save gets a new file name, so a cached
++ * copy of the old picture is never shown in place of the new one.
++ */
++private fun saveScaledImage(context: Context, uri: Uri, folder: String, baseName: String, maxPx: Int): String? {
++    return runCatching {
++        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
++        context.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
++        var sample = 1
++        while (bounds.outWidth / (sample * 2) >= maxPx && bounds.outHeight / (sample * 2) >= maxPx) sample *= 2
++        val opts = BitmapFactory.Options().apply { inSampleSize = sample }
++        val decoded = context.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, opts) }
++            ?: return@runCatching null
++        val longest = maxOf(decoded.width, decoded.height)
++        val bitmap = if (longest > maxPx) {
++            val k = maxPx.toFloat() / longest
++            Bitmap.createScaledBitmap(
++                decoded,
++                (decoded.width * k).toInt().coerceAtLeast(1),
++                (decoded.height * k).toInt().coerceAtLeast(1),
++                true,
++            )
++        } else {
++            decoded
++        }
++        val dir = File(context.filesDir, folder).apply { mkdirs() }
++        dir.listFiles()?.filter { it.name.startsWith("$baseName-") }?.forEach { it.delete() }
++        val file = File(dir, "$baseName-${System.currentTimeMillis()}.jpg")
++        file.outputStream().use { bitmap.compress(Bitmap.CompressFormat.JPEG, 90, it) }
++        Uri.fromFile(file).toString()
++    }.getOrNull()
++}
++
++/** What the user chose to show instead of the signed-in account's own name and picture. */
++data class ProfileOverride(val name: String? = null, val avatar: String? = null)
++
++object ProfileOverrides {
++    private const val PREF_NAME = "bitchord_overrides"
++    private const val KEY_NAME = "profile_name"
++    private const val KEY_AVATAR = "profile_avatar"
++
++    private lateinit var prefs: SharedPreferences
++
++    private val _state = MutableStateFlow(ProfileOverride())
++    val state: StateFlow<ProfileOverride> = _state.asStateFlow()
++
++    fun init(context: Context) {
++        prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
++        _state.value = ProfileOverride(
++            name = prefs.getString(KEY_NAME, null)?.takeIf { it.isNotBlank() },
++            avatar = prefs.getString(KEY_AVATAR, null)?.takeIf { it.isNotBlank() },
++        )
++    }
++
++    /** An empty name puts the account's own name back. */
++    fun setName(name: String?) {
++        val clean = name?.trim()?.takeIf { it.isNotEmpty() }
++        if (this::prefs.isInitialized) {
++            prefs.edit().apply {
++                if (clean == null) remove(KEY_NAME) else putString(KEY_NAME, clean)
++            }.apply()
++        }
++        _state.value = _state.value.copy(name = clean)
++    }
++
++    fun setAvatar(context: Context, uri: Uri): Boolean {
++        val saved = saveScaledImage(context, uri, "profile", "avatar", 512) ?: return false
++        if (this::prefs.isInitialized) prefs.edit().putString(KEY_AVATAR, saved).apply()
++        _state.value = _state.value.copy(avatar = saved)
++        return true
++    }
++
++    fun reset() {
++        if (this::prefs.isInitialized) prefs.edit().remove(KEY_NAME).remove(KEY_AVATAR).apply()
++        _state.value = ProfileOverride()
++    }
++}
++
++/** Own covers for albums and playlists, by browse id. Only this device sees them. */
++object CoverOverrides {
++    private const val PREF_NAME = "bitchord_overrides"
++    private const val KEY_COVERS = "covers_json"
++
++    private lateinit var prefs: SharedPreferences
++
++    private val _map = MutableStateFlow<Map<String, String>>(emptyMap())
++    val map: StateFlow<Map<String, String>> = _map.asStateFlow()
++
++    fun init(context: Context) {
++        prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
++        val raw = prefs.getString(KEY_COVERS, null) ?: return
++        runCatching {
++            val obj = JSONObject(raw)
++            _map.value = obj.keys().asSequence().associateWith { obj.getString(it) }
++        }
++    }
++
++    fun set(context: Context, id: String, uri: Uri): Boolean {
++        val saved = saveScaledImage(context, uri, "covers", id.hashCode().toUInt().toString(16), 1024) ?: return false
++        update(_map.value + (id to saved))
++        return true
++    }
++
++    fun clear(id: String) {
++        _map.value[id]?.let { runCatching { File(Uri.parse(it).path.orEmpty()).delete() } }
++        update(_map.value - id)
++    }
++
++    private fun update(next: Map<String, String>) {
++        _map.value = next
++        if (this::prefs.isInitialized) prefs.edit().putString(KEY_COVERS, JSONObject(next).toString()).apply()
++    }
++}
+diff --git a/app/src/main/java/com/music/bitchord/data/spotify/LocalPlaylistStore.kt b/app/src/main/java/com/music/bitchord/data/spotify/LocalPlaylistStore.kt
+index 0fc00ef..5188efd 100644
+--- a/app/src/main/java/com/music/bitchord/data/spotify/LocalPlaylistStore.kt
++++ b/app/src/main/java/com/music/bitchord/data/spotify/LocalPlaylistStore.kt
+@@ -89,6 +89,49 @@ object LocalPlaylistStore {
+         persist(updated)
+     }
+ 
++    /**
++     * Stores [songs] as the new running order of the playlist [id]. Refused
++     * (false) unless they are exactly the tracks it already holds.
++     */
++    fun reorder(id: String, songs: List<Song>): Boolean {
++        val current = getPlaylist(id) ?: return false
++        if (songs.map { it.videoId }.sorted() != current.songs.map { it.videoId }.sorted()) return false
++        val updated = _playlists.value.map { if (it.id == current.id) it.copy(songs = songs) else it }
++        _playlists.value = updated
++        persist(updated)
++        return true
++    }
++
++    /**
++     * Takes one track (the first with this [videoId]) out of the playlist [id].
++     * False when the playlist or the track is not there.
++     */
++    fun removeSong(id: String, videoId: String): Boolean {
++        val current = getPlaylist(id) ?: return false
++        val at = current.songs.indexOfFirst { it.videoId == videoId }
++        if (at < 0) return false
++        val trimmed = current.songs.filterIndexed { i, _ -> i != at }
++        val updated = _playlists.value.map { if (it.id == current.id) it.copy(songs = trimmed) else it }
++        _playlists.value = updated
++        persist(updated)
++        return true
++    }
++
++    /**
++     * Adds [songs] to the end of the playlist [id], skipping any it already
++     * holds. Returns how many went in.
++     */
++    fun addSongs(id: String, songs: List<Song>): Int {
++        val current = getPlaylist(id) ?: return 0
++        val have = current.songs.mapTo(HashSet()) { it.videoId }
++        val fresh = songs.filter { it.videoId.isNotBlank() && have.add(it.videoId) }
++        if (fresh.isEmpty()) return 0
++        val updated = _playlists.value.map { if (it.id == current.id) it.copy(songs = it.songs + fresh) else it }
++        _playlists.value = updated
++        persist(updated)
++        return fresh.size
++    }
++
+     fun getPlaylist(id: String): LocalPlaylist? {
+         val cleanId = id.removePrefix("local:playlist:").removePrefix("VL")
+         return _playlists.value.firstOrNull { it.id == cleanId || it.id == id || it.browseId == id }
+diff --git a/app/src/main/java/com/music/bitchord/ui/MainViewModel.kt b/app/src/main/java/com/music/bitchord/ui/MainViewModel.kt
+index d8427ad..8e928f7 100644
+--- a/app/src/main/java/com/music/bitchord/ui/MainViewModel.kt
++++ b/app/src/main/java/com/music/bitchord/ui/MainViewModel.kt
+@@ -555,7 +555,17 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
+     }
+ 
+     private val _account = MutableStateFlow<Account?>(null)
+-    val account: StateFlow<Account?> = _account.asStateFlow()
++    // What the screens show: the signed-in account, with the name and picture
++    // the user chose on top. _account itself stays as YouTube reports it.
++    val account: StateFlow<Account?> = combine(
++        _account,
++        com.music.bitchord.data.settings.ProfileOverrides.state,
++    ) { real, mine ->
++        real?.copy(
++            name = mine.name ?: real.name,
++            thumbnailUrl = mine.avatar ?: real.thumbnailUrl,
++        )
++    }.stateIn(viewModelScope, SharingStarted.Eagerly, null)
+ 
+     /**
+      * The channels this login can act as. Empty until the picker asks for
+@@ -1103,6 +1113,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
+         privacy: PlaylistPrivacy,
+         videoIds: List<String>,
+         songs: List<Song> = emptyList(),
++        /** Called with how many tracks YouTube Music would not take after several tries. */
++        onPartial: ((lost: Int) -> Unit)? = null,
+         /** [savedLocally] is true when the playlist went to this device, not YouTube Music. */
+         onResult: ((browseId: String?, title: String, savedLocally: Boolean) -> Unit)? = null,
+     ) {
+@@ -1116,11 +1128,14 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
+                     videoIds = initialBatch,
+                 ).fold(
+                     onSuccess = { playlistId ->
++                        var lost = 0
+                         if (videoIds.size > 50) {
+                             videoIds.drop(50).chunked(50).forEach { chunk ->
+-                                YtMusicRepository.addToPlaylist(playlistId, chunk)
++                                if (!addChunkWithRetry(playlistId, chunk)) lost += chunk.size
++                                delay(300)
+                             }
+                         }
++                        if (lost > 0) onPartial?.invoke(lost)
+                         setPlaylistOwned("VL$playlistId", true)
+                         libraryStale = true
+                         val created = UserPlaylist(
+@@ -1333,6 +1348,86 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
+         }
+     }
+ 
++    /**
++     * Saves a new running order for a playlist kept on this device — one of
++     * the offline player's own, or a Spotify import — and puts the open page
++     * into that order. Nothing is sent anywhere. False when the store refused.
++     */
++    fun reorderLocalPlaylist(browseId: String, reordered: List<Song>): Boolean {
++        // The reorder page tags rows with throwaway slot ids; they are not the playlist's.
++        val songs = reordered.map { it.copy(setVideoId = null) }
++        val saved = if (OfflinePlaylists.isOfflinePlaylist(browseId)) {
++            OfflinePlaylists.reorder(browseId, songs)
++        } else {
++            com.music.bitchord.data.spotify.LocalPlaylistStore.reorder(browseId, songs)
++        }
++        if (!saved) return false
++        fun Song.slot() = localUri ?: videoId
++        val rank = HashMap<String, Int>()
++        songs.forEachIndexed { index, song -> rank[song.slot()] = index }
++        _detailStack.value = _detailStack.value.map { page ->
++            val shown = (page.songs as? UiState.Success)?.data
++            if (page.browseId != browseId || shown == null) {
++                page
++            } else {
++                page.copy(songs = UiState.Success(shown.sortedBy { rank[it.slot()] ?: Int.MAX_VALUE }))
++            }
++        }
++        return true
++    }
++
++    /**
++     * Takes one track out of a Spotify import kept on this device and off the
++     * open page. Nothing is sent anywhere, so no account is needed.
++     */
++    fun removeFromLocalPlaylist(browseId: String, song: Song) {
++        if (!com.music.bitchord.data.spotify.LocalPlaylistStore.removeSong(browseId, song.videoId)) return
++        _detailStack.value = _detailStack.value.map { page ->
++            val shown = (page.songs as? UiState.Success)?.data
++            if (page.browseId != browseId || shown == null) {
++                page
++            } else {
++                val at = shown.indexOfFirst { it.videoId == song.videoId }
++                if (at < 0) page else page.copy(songs = UiState.Success(shown.filterIndexed { i, _ -> i != at }))
++            }
++        }
++    }
++
++    /**
++     * One batch of tracks into an account playlist, tried again when YouTube
++     * Music turns it down (a dropped connection or a rate limit are the usual
++     * reasons). False when every try failed, so the caller can say so instead
++     * of reporting a playlist shorter than it was asked to be.
++     */
++    private suspend fun addChunkWithRetry(playlistId: String, ids: List<String>): Boolean {
++        repeat(4) { attempt ->
++            if (YtMusicRepository.addToPlaylist(playlistId, ids).isSuccess) return true
++            delay(1_500L * (attempt + 1))
++        }
++        return false
++    }
++
++    /**
++     * Puts [videoIds] into the account playlist [playlistId], 50 at a time.
++     * [onDone] gets how many went in and how many could not be added.
++     */
++    fun addVideoIdsToPlaylist(
++        playlistId: String,
++        videoIds: List<String>,
++        onDone: (added: Int, lost: Int) -> Unit,
++    ) {
++        viewModelScope.launch {
++            val ids = videoIds.distinct()
++            var lost = 0
++            ids.chunked(50).forEach { chunk ->
++                if (!addChunkWithRetry(playlistId, chunk)) lost += chunk.size
++                delay(300)
++            }
++            libraryStale = true
++            onDone(ids.size - lost, lost)
++        }
++    }
++
+     fun deletePlaylist(playlist: UserPlaylist) {
+         if (!requireSignIn()) return
+         viewModelScope.launch {
+diff --git a/app/src/main/java/com/music/bitchord/ui/components/BrowseActionsMenu.kt b/app/src/main/java/com/music/bitchord/ui/components/BrowseActionsMenu.kt
+index 6fbf85e..c67f36d 100644
+--- a/app/src/main/java/com/music/bitchord/ui/components/BrowseActionsMenu.kt
++++ b/app/src/main/java/com/music/bitchord/ui/components/BrowseActionsMenu.kt
+@@ -134,6 +134,12 @@ fun BrowseActionsMenu(
+      * playlist the account only saved.
+      */
+     onReorder: (() -> Unit)? = null,
++    /** Picks a picture of the user's own to show as this release's cover. */
++    onChangeCover: (() -> Unit)? = null,
++    /** Puts the release's own cover back. */
++    onResetCover: (() -> Unit)? = null,
++    /** Offers to add every track of this release to another playlist. */
++    onMoveAll: (() -> Unit)? = null,
+     onDelete: (() -> Unit)? = null,
+     /**
+      * Removes the files this release was downloaded as, when it was downloaded
+@@ -254,6 +260,15 @@ fun BrowseActionsMenu(
+             onReorder?.let {
+                 ActionRow(SfIcons.Reorder, stringResource(R.string.reorder_songs), onClick = it)
+             }
++            onMoveAll?.let {
++                ActionRow(SfIcons.AddToPlaylist, stringResource(R.string.move_all_songs), onClick = it)
++            }
++            onChangeCover?.let {
++                ActionRow(SfIcons.Pencil, stringResource(R.string.change_cover), onClick = it)
++            }
++            onResetCover?.let {
++                ActionRow(SfIcons.Pencil, stringResource(R.string.reset_cover), onClick = it)
++            }
+             if (onDelete != null) {
+                 if (confirmingDelete) {
+                     ActionRow(
+diff --git a/app/src/main/java/com/music/bitchord/ui/components/FastScrollbar.kt b/app/src/main/java/com/music/bitchord/ui/components/FastScrollbar.kt
+new file mode 100644
+index 0000000..e0dc25e
+--- /dev/null
++++ b/app/src/main/java/com/music/bitchord/ui/components/FastScrollbar.kt
+@@ -0,0 +1,130 @@
++package com.music.bitchord.ui.components
++
++import androidx.compose.animation.AnimatedVisibility
++import androidx.compose.animation.fadeIn
++import androidx.compose.animation.fadeOut
++import androidx.compose.foundation.background
++import androidx.compose.foundation.gestures.detectVerticalDragGestures
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.BoxWithConstraints
++import androidx.compose.foundation.layout.fillMaxHeight
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.offset
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.width
++import androidx.compose.foundation.lazy.LazyListState
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.derivedStateOf
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.input.pointer.pointerInput
++import androidx.compose.ui.platform.LocalDensity
++import androidx.compose.ui.unit.Dp
++import androidx.compose.ui.unit.IntOffset
++import androidx.compose.ui.unit.dp
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.launch
++import kotlin.math.roundToInt
++
++/**
++ * A thumb on the right edge for long lists: it shows while the list moves and
++ * can be dragged to jump a long way at once. Lists shorter than [minItems]
++ * get nothing, since the ordinary scroll covers them.
++ *
++ * Place it in a Box over the list, aligned to the end.
++ */
++@Composable
++fun FastScrollbar(
++    state: LazyListState,
++    modifier: Modifier = Modifier,
++    topPadding: Dp = 0.dp,
++    bottomPadding: Dp = 0.dp,
++    minItems: Int = 30,
++) {
++    val total by remember(state) { derivedStateOf { state.layoutInfo.totalItemsCount } }
++    if (total < minItems) return
++
++    var dragging by remember { mutableStateOf(false) }
++    var dragFraction by remember { mutableStateOf(0f) }
++    var shown by remember { mutableStateOf(false) }
++    val scrolling = state.isScrollInProgress
++
++    LaunchedEffect(scrolling, dragging) {
++        if (scrolling || dragging) {
++            shown = true
++        } else {
++            delay(1500)
++            shown = false
++        }
++    }
++
++    val scrollFraction by remember(state) {
++        derivedStateOf {
++            val info = state.layoutInfo
++            val maxFirst = (info.totalItemsCount - info.visibleItemsInfo.size).coerceAtLeast(1)
++            (state.firstVisibleItemIndex.toFloat() / maxFirst).coerceIn(0f, 1f)
++        }
++    }
++    val fraction = if (dragging) dragFraction else scrollFraction
++
++    BoxWithConstraints(
++        modifier = modifier
++            .fillMaxHeight()
++            .padding(top = topPadding, bottom = bottomPadding),
++    ) {
++        val thumbHeight = 56.dp
++        val trackPx = with(LocalDensity.current) { maxHeight.toPx() }
++        val thumbPx = with(LocalDensity.current) { thumbHeight.toPx() }
++        val travel = (trackPx - thumbPx).coerceAtLeast(1f)
++        val scope = rememberCoroutineScope()
++
++        AnimatedVisibility(
++            visible = shown,
++            enter = fadeIn(),
++            exit = fadeOut(),
++            modifier = Modifier.align(Alignment.TopEnd),
++        ) {
++            Box(
++                modifier = Modifier
++                    .offset { IntOffset(0, (fraction * travel).roundToInt()) }
++                    .width(18.dp)
++                    .height(thumbHeight)
++                    .pointerInput(total, travel) {
++                        detectVerticalDragGestures(
++                            onDragStart = {
++                                dragFraction = scrollFraction
++                                dragging = true
++                            },
++                            onDragEnd = { dragging = false },
++                            onDragCancel = { dragging = false },
++                        ) { change, dragAmount ->
++                            change.consume()
++                            dragFraction = (dragFraction + dragAmount / travel).coerceIn(0f, 1f)
++                            val target = (dragFraction * (total - 1)).roundToInt()
++                            scope.launch { state.scrollToItem(target) }
++                        }
++                    },
++                contentAlignment = Alignment.CenterEnd,
++            ) {
++                Box(
++                    modifier = Modifier
++                        .padding(end = 3.dp)
++                        .width(if (dragging) 8.dp else 5.dp)
++                        .fillMaxHeight()
++                        .background(
++                            MaterialTheme.colorScheme.onSurface.copy(alpha = 0.55f),
++                            RoundedCornerShape(50),
++                        ),
++                )
++            }
++        }
++    }
++}
+diff --git a/app/src/main/java/com/music/bitchord/ui/components/SongActionsMenu.kt b/app/src/main/java/com/music/bitchord/ui/components/SongActionsMenu.kt
+index 8edc097..970dba2 100644
+--- a/app/src/main/java/com/music/bitchord/ui/components/SongActionsMenu.kt
++++ b/app/src/main/java/com/music/bitchord/ui/components/SongActionsMenu.kt
+@@ -304,6 +304,15 @@ fun SongActionsMenu(
+                     onClick = it,
+                 )
+             }
++        } else onRemoveFromPlaylist?.let {
++            // A playlist kept on this device needs no account to edit.
++            if (startsGroup()) IosMenuSeparator()
++            ActionRow(
++                icon = SfIcons.RemoveFromPlaylist,
++                label = stringResource(R.string.remove_from_playlist),
++                accent = palette.accent,
++                onClick = it,
++            )
+         }
+ 
+         // Where the track goes next, and what is kept of it. The file rows
+diff --git a/app/src/main/java/com/music/bitchord/ui/screens/AccountAndScrobblingScreen.kt b/app/src/main/java/com/music/bitchord/ui/screens/AccountAndScrobblingScreen.kt
+index 8f20839..c2fab2e 100644
+--- a/app/src/main/java/com/music/bitchord/ui/screens/AccountAndScrobblingScreen.kt
++++ b/app/src/main/java/com/music/bitchord/ui/screens/AccountAndScrobblingScreen.kt
+@@ -24,6 +24,23 @@ import com.music.bitchord.ui.components.IosSwitch
+ import androidx.compose.material3.Text
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import android.widget.Toast
++import androidx.activity.compose.rememberLauncherForActivityResult
++import androidx.activity.result.contract.ActivityResultContracts
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.shape.CircleShape
++import androidx.compose.material3.AlertDialog
++import androidx.compose.material3.OutlinedTextField
++import androidx.compose.material3.TextButton
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.layout.ContentScale
++import androidx.compose.ui.platform.LocalContext
++import coil3.compose.AsyncImage
++import com.music.bitchord.data.settings.ProfileOverrides
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.graphics.vector.ImageVector
+ import androidx.compose.ui.res.vectorResource
+@@ -66,6 +83,10 @@ fun AccountAndScrobblingScreen(
+     val discordUsername by AppSettings.discordUsername.collectAsStateWithLifecycle()
+     val discordRpcEnabled by AppSettings.discordRpcEnabled.collectAsStateWithLifecycle()
+     val spotifyConnected by AppSettings.spotifySpdcToken.collectAsStateWithLifecycle()
++    var editingProfile by remember { mutableStateOf(false) }
++    if (editingProfile) {
++        EditProfileDialog(account = account, onDismiss = { editingProfile = false })
++    }
+ 
+     Column(
+         modifier = modifier
+@@ -97,6 +118,13 @@ fun AccountAndScrobblingScreen(
+                     onClick = onSwitchChannel,
+                 )
+                 FullWidthDivider()
++                SettingsRow(
++                    icon = SfIcons.Person,
++                    title = stringResource(R.string.edit_profile),
++                    subtitle = account?.name,
++                    onClick = { editingProfile = true },
++                )
++                FullWidthDivider()
+                 DestructiveRow(label = stringResource(R.string.sign_out), onClick = onSignOut)
+             }
+         }
+@@ -329,3 +357,63 @@ fun AccountAndScrobblingScreen(
+ private fun FullWidthDivider() {
+     HorizontalDivider(thickness = 0.5.dp, color = MaterialTheme.colorScheme.outline)
+ }
++
++/**
++ * A name and a picture of the user's own, shown in place of the account's.
++ * Kept on this device only; the Google account is not touched.
++ */
++@Composable
++private fun EditProfileDialog(account: Account?, onDismiss: () -> Unit) {
++    val context = LocalContext.current
++    val saved by ProfileOverrides.state.collectAsStateWithLifecycle()
++    var name by remember { mutableStateOf(saved.name ?: account?.name.orEmpty()) }
++    val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
++        if (uri != null && !ProfileOverrides.setAvatar(context, uri)) {
++            Toast.makeText(context, context.getString(R.string.cover_failed), Toast.LENGTH_SHORT).show()
++        }
++    }
++    AlertDialog(
++        onDismissRequest = onDismiss,
++        title = { Text(stringResource(R.string.edit_profile)) },
++        text = {
++            Column {
++                AsyncImage(
++                    model = saved.avatar ?: account?.thumbnailUrl,
++                    contentDescription = null,
++                    contentScale = ContentScale.Crop,
++                    modifier = Modifier
++                        .size(72.dp)
++                        .clip(CircleShape)
++                        .clickable { picker.launch("image/*") },
++                )
++                TextButton(onClick = { picker.launch("image/*") }) {
++                    Text(stringResource(R.string.edit_profile_photo))
++                }
++                OutlinedTextField(
++                    value = name,
++                    onValueChange = { name = it },
++                    singleLine = true,
++                    label = { Text(stringResource(R.string.edit_profile_name)) },
++                )
++                Spacer(Modifier.height(10.dp))
++                Text(
++                    text = stringResource(R.string.edit_profile_note),
++                    style = MaterialTheme.typography.bodySmall,
++                    color = MaterialTheme.colorScheme.onSurfaceVariant,
++                )
++            }
++        },
++        confirmButton = {
++            TextButton(onClick = {
++                ProfileOverrides.setName(name)
++                onDismiss()
++            }) { Text(stringResource(R.string.edit_profile_save)) }
++        },
++        dismissButton = {
++            TextButton(onClick = {
++                ProfileOverrides.reset()
++                onDismiss()
++            }) { Text(stringResource(R.string.edit_profile_reset)) }
++        },
++    )
++}
+diff --git a/app/src/main/java/com/music/bitchord/ui/screens/DetailScreen.kt b/app/src/main/java/com/music/bitchord/ui/screens/DetailScreen.kt
+index 56f5102..cb5a982 100644
+--- a/app/src/main/java/com/music/bitchord/ui/screens/DetailScreen.kt
++++ b/app/src/main/java/com/music/bitchord/ui/screens/DetailScreen.kt
+@@ -1277,6 +1277,9 @@ internal fun List<Song>.sortedForDetail(sort: SongSort): List<Song> = when (sort
+     SongSort.DEFAULT -> this
+     SongSort.TITLE_ASC -> sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.title })
+     SongSort.TITLE_DESC -> sortedWith(compareByDescending(String.CASE_INSENSITIVE_ORDER) { it.title })
++    // Ties (same artist) keep their running order: sortedWith is stable.
++    SongSort.ARTIST_ASC -> sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.artist })
++    SongSort.ARTIST_DESC -> sortedWith(compareByDescending(String.CASE_INSENSITIVE_ORDER) { it.artist })
+     // A catalogue row carries no added date, so its place in the running
+     // order stands in for one: a playlist is appended to as songs are added,
+     // and reversed that puts the most recent addition on top. Rows that do
+diff --git a/app/src/main/res/values-ru/strings.xml b/app/src/main/res/values-ru/strings.xml
+index 9f09b05..5be9c56 100644
+--- a/app/src/main/res/values-ru/strings.xml
++++ b/app/src/main/res/values-ru/strings.xml
+@@ -615,6 +615,8 @@
+     <string name="sort_music">Сортировка музыки</string>
+     <string name="sort_title_ascending">По алфавиту (А — Я)</string>
+     <string name="sort_title_descending">По алфавиту (Я — А)</string>
++    <string name="sort_artist_ascending">По исполнителю (А — Я)</string>
++    <string name="sort_artist_descending">По исполнителю (Я — А)</string>
+     <string name="sort_date_added">По дате добавления (сначала новые)</string>
+     <string name="sort_date_modified">По дате изменения (сначала новые)</string>
+     <string name="use_all_audio_folders">Использовать все папки с аудио</string>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 7a99325..73ec292 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -1,4 +1,4 @@
+-<resources>
++<resources xmlns:tools="http://schemas.android.com/tools">
+     <string name="app_name">BitChord</string>
+     <string name="playback_channel_name">Now playing</string>
+     <string name="download_channel_name">Downloads</string>
+@@ -682,6 +682,21 @@
+     <string name="remove_from_playlist">Remove from this playlist</string>
+     <string name="rename_playlist">Rename playlist</string>
+     <string name="reorder_songs">Reorder songs</string>
++    <string name="change_cover" tools:ignore="MissingTranslation">Change cover</string>
++    <string name="reset_cover" tools:ignore="MissingTranslation">Reset cover</string>
++    <string name="cover_changed" tools:ignore="MissingTranslation">Cover changed</string>
++    <string name="cover_failed" tools:ignore="MissingTranslation">Couldn\'t use that picture</string>
++    <string name="move_all_songs" tools:ignore="MissingTranslation">Add all songs to another playlist</string>
++    <string name="move_all_done" tools:ignore="MissingTranslation">%1$d songs added</string>
++    <string name="move_all_nothing" tools:ignore="MissingTranslation">Nothing new to add — they are all there already</string>
++    <string name="move_all_partial" tools:ignore="MissingTranslation">%1$d songs added, %2$d couldn\'t be added</string>
++    <string name="spotify_import_partial" tools:ignore="MissingTranslation">%1$d songs couldn\'t be added to the playlist on YouTube Music</string>
++    <string name="edit_profile" tools:ignore="MissingTranslation">Edit name and picture</string>
++    <string name="edit_profile_name" tools:ignore="MissingTranslation">Name</string>
++    <string name="edit_profile_photo" tools:ignore="MissingTranslation">Choose picture</string>
++    <string name="edit_profile_reset" tools:ignore="MissingTranslation">Use the account\'s own</string>
++    <string name="edit_profile_save" tools:ignore="MissingTranslation">Save</string>
++    <string name="edit_profile_note" tools:ignore="MissingTranslation">Shown only in this app, on this device. Your Google account is not changed.</string>
+     <string name="reorder_failed">Couldn\'t save the new order</string>
+     <string name="playlist_reordered">Playlist order saved</string>
+     <string name="reset_to_default">Reset to default</string>
+@@ -845,6 +860,8 @@
+     <string name="sort_music">Sort music</string>
+     <string name="sort_title_ascending">Alphabetical (A to Z)</string>
+     <string name="sort_title_descending">Alphabetical (Z to A)</string>
++    <string name="sort_artist_ascending" tools:ignore="MissingTranslation">Artist (A to Z)</string>
++    <string name="sort_artist_descending" tools:ignore="MissingTranslation">Artist (Z to A)</string>
+     <string name="sort_date_added">Date added (newest first)</string>
+     <string name="sort_date_added_oldest">Date added (oldest first)</string>
+     <string name="sort_date_added_toggle">Date added</string>
